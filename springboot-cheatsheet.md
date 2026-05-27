@@ -14,14 +14,16 @@ Everything you need to build production Spring Boot services in Kotlin. All exam
 4. [Request Handling](#request-handling)
 5. [Response Types](#response-types)
 6. [Services & Dependency Injection](#services--dependency-injection)
-7. [Spring Data JPA](#spring-data-jpa)
-8. [Exception Handling](#exception-handling)
-9. [Validation](#validation)
-10. [Configuration](#configuration)
-11. [Security Basics](#security-basics)
-12. [Testing](#testing)
-13. [Coroutines with Spring](#coroutines-with-spring)
-14. [Quick Reference](#quick-reference)
+7. [Spring Data JPA (PostgreSQL / MySQL)](#spring-data-jpa-postgresql--mysql)
+8. [Redis](#redis)
+9. [MongoDB](#mongodb)
+10. [Exception Handling](#exception-handling)
+11. [Validation](#validation)
+12. [Configuration](#configuration)
+13. [Security Basics](#security-basics)
+14. [Testing](#testing)
+15. [Coroutines with Spring](#coroutines-with-spring)
+16. [Quick Reference](#quick-reference)
 
 ---
 
@@ -44,6 +46,9 @@ version = "0.0.1-SNAPSHOT"
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-data-redis")
+    implementation("org.springframework.boot:spring-boot-starter-data-mongodb")
+    implementation("org.springframework.boot:spring-boot-starter-cache")
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
@@ -84,6 +89,25 @@ spring:
     show-sql: false
     properties:
       hibernate.format_sql: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: 6379
+      password: ${REDIS_PASS:}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+
+    mongodb:
+      uri: ${MONGO_URI:mongodb://localhost:27017/mydb}
+
+  cache:
+    type: redis
+    redis:
+      time-to-live: 600000      # 10 minutes in ms (default TTL)
 
 server:
   port: 8080
@@ -341,7 +365,7 @@ class AppConfig {
 
 ---
 
-## Spring Data JPA
+## Spring Data JPA (PostgreSQL / MySQL)
 
 ### Entity
 
@@ -432,6 +456,444 @@ object UserSpecs {
 // Usage — repository must extend JpaSpecificationExecutor<User>
 val spec = UserSpecs.hasRole(UserRole.ADMIN).and(UserSpecs.nameContains("alice"))
 userRepository.findAll(spec, PageRequest.of(0, 20))
+```
+
+---
+
+## Redis
+
+Redis is used for caching, session storage, rate limiting, pub/sub messaging, and any data that benefits from in-memory speed with optional persistence.
+
+### Configuration
+
+```kotlin
+@Configuration
+@EnableCaching
+class RedisConfig {
+
+    @Bean
+    fun redisConnectionFactory(
+        @Value("\${spring.data.redis.host}") host: String,
+        @Value("\${spring.data.redis.port}") port: Int
+    ): LettuceConnectionFactory = LettuceConnectionFactory(host, port)
+
+    // Typed template — use this instead of the default StringRedisTemplate
+    @Bean
+    fun redisTemplate(factory: LettuceConnectionFactory): RedisTemplate<String, Any> {
+        val jackson = Jackson2JsonRedisSerializer(Any::class.java)
+        return RedisTemplate<String, Any>().apply {
+            connectionFactory = factory
+            keySerializer = StringRedisSerializer()
+            valueSerializer = jackson
+            hashKeySerializer = StringRedisSerializer()
+            hashValueSerializer = jackson
+            afterPropertiesSet()
+        }
+    }
+
+    // Cache manager — controls TTL per cache name
+    @Bean
+    fun cacheManager(factory: LettuceConnectionFactory): RedisCacheManager {
+        val defaults = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair.fromSerializer(
+                    Jackson2JsonRedisSerializer(Any::class.java)
+                )
+            )
+
+        val perCache = mapOf(
+            "users"    to defaults.entryTtl(Duration.ofMinutes(30)),
+            "sessions" to defaults.entryTtl(Duration.ofHours(2))
+        )
+
+        return RedisCacheManager.builder(factory)
+            .cacheDefaults(defaults)
+            .withInitialCacheConfigurations(perCache)
+            .build()
+    }
+}
+```
+
+### Spring Cache Abstraction (@Cacheable)
+
+The easiest way to use Redis — annotate service methods and Spring handles get/set automatically.
+
+```kotlin
+@Service
+class UserService(private val userRepository: UserRepository) {
+
+    // Cache result; key defaults to method args. Evict on update/delete.
+    @Cacheable(cacheNames = ["users"], key = "#id")
+    fun findById(id: Long): UserResponse =
+        userRepository.findById(id)
+            .map(UserResponse::from)
+            .orElseThrow { NotFoundException("User", id) }
+
+    @CachePut(cacheNames = ["users"], key = "#result.id")   // update cache after save
+    @Transactional
+    fun update(id: Long, request: UpdateUserRequest): UserResponse {
+        val user = userRepository.findById(id).orElseThrow { NotFoundException("User", id) }
+        user.name = request.name
+        return UserResponse.from(userRepository.save(user))
+    }
+
+    @CacheEvict(cacheNames = ["users"], key = "#id")
+    @Transactional
+    fun delete(id: Long) = userRepository.deleteById(id)
+
+    // Evict all entries in a cache (e.g. after a bulk operation)
+    @CacheEvict(cacheNames = ["users"], allEntries = true)
+    fun invalidateAll() = Unit
+}
+```
+
+### RedisTemplate (Low-Level Operations)
+
+Use `RedisTemplate` when you need direct control — counters, TTLs, atomic ops, or data structures.
+
+```kotlin
+@Service
+class CacheService(private val redis: RedisTemplate<String, Any>) {
+
+    private val ops get() = redis.opsForValue()
+    private val hashOps get() = redis.opsForHash<String, Any>()
+    private val listOps get() = redis.opsForList()
+    private val setOps get() = redis.opsForSet()
+    private val zSetOps get() = redis.opsForZSet()
+
+    // String / scalar
+    fun set(key: String, value: Any, ttl: Duration) =
+        ops.set(key, value, ttl)
+
+    fun get(key: String): Any? = ops.get(key)
+
+    fun increment(key: String): Long = ops.increment(key) ?: 0L
+
+    // Atomic set-if-absent (mutex / distributed lock primitive)
+    fun setIfAbsent(key: String, value: Any, ttl: Duration): Boolean =
+        ops.setIfAbsent(key, value, ttl) ?: false
+
+    fun delete(key: String) = redis.delete(key)
+
+    fun exists(key: String): Boolean = redis.hasKey(key) ?: false
+
+    fun expire(key: String, ttl: Duration) = redis.expire(key, ttl)
+
+    // Hash (like a nested map — good for objects)
+    fun hSet(key: String, field: String, value: Any) =
+        hashOps.put(key, field, value)
+
+    fun hGet(key: String, field: String): Any? = hashOps.get(key, field)
+
+    fun hGetAll(key: String): Map<String, Any> =
+        hashOps.entries(key)
+
+    // List (queue / stack)
+    fun lpush(key: String, value: Any) = listOps.leftPush(key, value)
+    fun rpop(key: String): Any? = listOps.rightPop(key)
+    fun lrange(key: String, start: Long, end: Long): List<Any> =
+        listOps.range(key, start, end) ?: emptyList()
+
+    // Sorted set (leaderboards, priority queues)
+    fun zadd(key: String, value: Any, score: Double) =
+        zSetOps.add(key, value, score)
+
+    fun zrange(key: String, start: Long, end: Long): Set<Any> =
+        zSetOps.range(key, start, end) ?: emptySet()
+
+    fun zrank(key: String, value: Any): Long? = zSetOps.rank(key, value)
+}
+```
+
+### Rate Limiting
+
+```kotlin
+@Service
+class RateLimiter(private val redis: RedisTemplate<String, Any>) {
+
+    // Sliding window counter — returns true if the request is allowed
+    fun allow(identifier: String, limit: Int, window: Duration): Boolean {
+        val key = "rate:$identifier"
+        val ops = redis.opsForValue()
+        val current = ops.increment(key) ?: 1L
+        if (current == 1L) redis.expire(key, window)   // set TTL on first request
+        return current <= limit
+    }
+}
+
+// Use it in a filter or controller
+@Component
+class RateLimitFilter(private val rateLimiter: RateLimiter) : OncePerRequestFilter() {
+    override fun doFilterInternal(
+        request: HttpServletRequest,
+        response: HttpServletResponse,
+        chain: FilterChain
+    ) {
+        val ip = request.remoteAddr
+        if (!rateLimiter.allow(ip, limit = 100, window = Duration.ofMinutes(1))) {
+            response.status = HttpStatus.TOO_MANY_REQUESTS.value()
+            return
+        }
+        chain.doFilter(request, response)
+    }
+}
+```
+
+### Pub/Sub Messaging
+
+```kotlin
+// Publisher
+@Service
+class EventPublisher(private val redis: RedisTemplate<String, Any>) {
+
+    fun publish(channel: String, event: Any) =
+        redis.convertAndSend(channel, event)
+}
+
+// Subscriber
+@Component
+class UserEventListener : MessageListener {
+    override fun onMessage(message: Message, pattern: ByteArray?) {
+        val payload = String(message.body)
+        println("Received on ${message.channel}: $payload")
+    }
+}
+
+// Wire it up
+@Configuration
+class PubSubConfig {
+
+    @Bean
+    fun listenerContainer(
+        factory: LettuceConnectionFactory,
+        listener: UserEventListener
+    ): RedisMessageListenerContainer {
+        return RedisMessageListenerContainer().apply {
+            connectionFactory = factory
+            addMessageListener(listener, ChannelTopic("user-events"))
+        }
+    }
+}
+```
+
+### Redis as a Spring Session Store
+
+```kotlin
+// build.gradle.kts
+// implementation("org.springframework.session:spring-session-data-redis")
+
+@Configuration
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 3600)
+class SessionConfig
+// That's it — all HttpSession calls now persist to Redis automatically.
+```
+
+---
+
+## MongoDB
+
+MongoDB is a good fit when your schema is evolving fast, your data is document-shaped, or you need flexible querying without a rigid relational model.
+
+### Document (Entity)
+
+```kotlin
+@Document(collection = "products")
+data class Product(
+    @Id val id: String? = null,              // MongoDB uses String ObjectId by default
+    val name: String,
+    val description: String,
+    val price: BigDecimal,
+    val tags: List<String> = emptyList(),
+    val metadata: Map<String, Any> = emptyMap(),
+
+    @Indexed(unique = true)
+    val sku: String,
+
+    @Indexed
+    val categoryId: String,
+
+    @Field("created_at")
+    val createdAt: Instant = Instant.now(),
+
+    val active: Boolean = true
+)
+
+// Embedded document (no @Document — it's stored inside the parent)
+data class Address(
+    val street: String,
+    val city: String,
+    val country: String,
+    val zip: String
+)
+
+@Document(collection = "customers")
+data class Customer(
+    @Id val id: String? = null,
+    val name: String,
+    val email: String,
+    val address: Address,                    // embedded — no join needed
+    val orderIds: List<String> = emptyList() // reference by ID (manual join)
+)
+```
+
+### Repository
+
+```kotlin
+@Repository
+interface ProductRepository : MongoRepository<Product, String> {
+
+    fun findByCategoryId(categoryId: String): List<Product>
+    fun findByActiveTrue(): List<Product>
+    fun findByPriceLessThanEqual(maxPrice: BigDecimal): List<Product>
+    fun findByTagsContaining(tag: String): List<Product>
+    fun findByNameContainingIgnoreCase(name: String, pageable: Pageable): Page<Product>
+    fun existsBySku(sku: String): Boolean
+    fun deleteByActiveFalse()
+
+    // Custom MongoDB query (MQL)
+    @Query("{ 'price': { '\$lte': ?0 }, 'active': true }")
+    fun findCheapActive(maxPrice: BigDecimal): List<Product>
+
+    // Projection — return only specific fields
+    @Query(value = "{ 'categoryId': ?0 }", fields = "{ 'name': 1, 'price': 1, 'sku': 1 }")
+    fun findSummaryByCategory(categoryId: String): List<ProductSummary>
+}
+
+data class ProductSummary(val id: String, val name: String, val price: BigDecimal, val sku: String)
+```
+
+### MongoTemplate (Advanced Queries)
+
+Use `MongoTemplate` for dynamic queries, aggregations, and bulk operations that the repository DSL can't express.
+
+```kotlin
+@Service
+class ProductService(
+    private val productRepository: ProductRepository,
+    private val mongo: MongoTemplate
+) {
+
+    // Dynamic query with Criteria
+    fun search(name: String?, tag: String?, maxPrice: BigDecimal?, active: Boolean = true): List<Product> {
+        val criteria = Criteria.where("active").`is`(active).apply {
+            name?.let { and("name").regex(it, "i") }
+            tag?.let { and("tags").`in`(it) }
+            maxPrice?.let { and("price").lte(it) }
+        }
+        val query = Query(criteria).with(Sort.by(Sort.Direction.ASC, "name"))
+        return mongo.find(query, Product::class.java)
+    }
+
+    // Update a single field without loading the full document
+    fun updatePrice(id: String, newPrice: BigDecimal) {
+        val query = Query(Criteria.where("_id").`is`(id))
+        val update = Update().set("price", newPrice).currentDate("updatedAt")
+        mongo.updateFirst(query, update, Product::class.java)
+    }
+
+    // Upsert
+    fun upsertBySkU(product: Product) {
+        val query = Query(Criteria.where("sku").`is`(product.sku))
+        val update = Update()
+            .set("name", product.name)
+            .set("price", product.price)
+            .set("active", product.active)
+            .setOnInsert("createdAt", Instant.now())
+        mongo.upsert(query, update, Product::class.java)
+    }
+
+    // Bulk write
+    fun bulkDeactivate(ids: List<String>) {
+        val query = Query(Criteria.where("_id").`in`(ids))
+        val update = Update().set("active", false)
+        mongo.updateMulti(query, update, Product::class.java)
+    }
+}
+```
+
+### Aggregation Pipeline
+
+```kotlin
+@Service
+class AnalyticsService(private val mongo: MongoTemplate) {
+
+    data class CategoryStats(val id: String, val count: Int, val avgPrice: Double)
+
+    // Equivalent to: GROUP BY categoryId, count(*), avg(price)
+    fun statsByCategory(): List<CategoryStats> {
+        val agg = Aggregation.newAggregation(
+            Aggregation.match(Criteria.where("active").`is`(true)),
+            Aggregation.group("categoryId")
+                .count().`as`("count")
+                .avg("price").`as`("avgPrice"),
+            Aggregation.sort(Sort.Direction.DESC, "count"),
+            Aggregation.limit(20)
+        )
+        return mongo.aggregate(agg, "products", CategoryStats::class.java).mappedResults
+    }
+
+    // Lookup (left join from orders → products)
+    fun ordersWithProducts(): List<Document> {
+        val agg = Aggregation.newAggregation(
+            Aggregation.lookup("products", "productId", "_id", "product"),
+            Aggregation.unwind("product"),
+            Aggregation.project("quantity", "product.name", "product.price")
+        )
+        return mongo.aggregate(agg, "orders", Document::class.java).mappedResults
+    }
+}
+```
+
+### Indexes
+
+```kotlin
+@Document(collection = "products")
+@CompoundIndexes(
+    CompoundIndex(name = "category_price_idx", def = "{'categoryId': 1, 'price': -1}"),
+    CompoundIndex(name = "sku_active_idx", def = "{'sku': 1, 'active': 1}", unique = true)
+)
+data class Product( /* ... */ )
+
+// Or programmatically (e.g. in a @PostConstruct or migration)
+@Component
+class MongoIndexInitializer(private val mongo: MongoTemplate) {
+
+    @PostConstruct
+    fun ensureIndexes() {
+        val ops = mongo.indexOps("products")
+        ops.ensureIndex(
+            Index().on("tags", Sort.Direction.ASC).named("tags_idx")
+        )
+        ops.ensureIndex(
+            Index().on("createdAt", Sort.Direction.DESC)
+                .expire(Duration.ofDays(90))   // TTL index — auto-delete old docs
+                .named("ttl_idx")
+        )
+    }
+}
+```
+
+### Reactive MongoDB (Coroutines)
+
+```kotlin
+// build.gradle.kts — swap out starter:
+// implementation("org.springframework.boot:spring-boot-starter-data-mongodb-reactive")
+
+interface ProductRepository : CoroutineCrudRepository<Product, String> {
+    fun findByCategoryId(categoryId: String): Flow<Product>
+    suspend fun findBySku(sku: String): Product?
+}
+
+@Service
+class ProductService(private val repo: ProductRepository) {
+
+    suspend fun findBySku(sku: String): Product =
+        repo.findBySku(sku) ?: throw NotFoundException("Product", sku)
+
+    fun streamByCategory(categoryId: String): Flow<Product> =
+        repo.findByCategoryId(categoryId)
+}
 ```
 
 ---
