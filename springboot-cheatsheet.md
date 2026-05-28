@@ -553,48 +553,70 @@ Redis is used for caching, session storage, rate limiting, pub/sub messaging, an
 
 ### Configuration
 
+Spring Boot auto-configures the Redis connection from `application.properties` — you only need to define the template and cache manager beans.
+
+```yaml
+# application.yml
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+```
+
+```kotlin
+// build.gradle.kts
+implementation("org.springframework.boot:spring-boot-starter-data-redis")
+implementation("org.springframework.boot:spring-boot-starter-cache")
+implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
+```
+
 ```kotlin
 @Configuration
 @EnableCaching
 class RedisConfig {
 
-    @Bean
-    fun redisConnectionFactory(
-        @Value("\${spring.data.redis.host}") host: String,
-        @Value("\${spring.data.redis.port}") port: Int
-    ): LettuceConnectionFactory = LettuceConnectionFactory(host, port)
+    // ObjectMapper shared by both beans — registers Kotlin support and type info
+    // so deserialization of generic types (List<Order>, etc.) works correctly.
+    private val mapper = ObjectMapper().apply {
+        registerModule(kotlinModule())
+        activateDefaultTyping(polymorphicTypeValidator, ObjectMapper.DefaultTyping.NON_FINAL)
+    }
 
     // Typed template — use this instead of the default StringRedisTemplate
     @Bean
-    fun redisTemplate(factory: LettuceConnectionFactory): RedisTemplate<String, Any> {
-        val jackson = Jackson2JsonRedisSerializer(Any::class.java)
+    fun redisTemplate(connectionFactory: RedisConnectionFactory): RedisTemplate<String, Any> {
+        val jsonSerializer = GenericJackson2JsonRedisSerializer(mapper)
         return RedisTemplate<String, Any>().apply {
-            connectionFactory = factory
-            keySerializer = StringRedisSerializer()
-            valueSerializer = jackson
-            hashKeySerializer = StringRedisSerializer()
-            hashValueSerializer = jackson
+            this.connectionFactory = connectionFactory
+            keySerializer       = StringRedisSerializer()
+            valueSerializer     = jsonSerializer
+            hashKeySerializer   = StringRedisSerializer()
+            hashValueSerializer = jsonSerializer
             afterPropertiesSet()
         }
     }
 
     // Cache manager — controls TTL per cache name
     @Bean
-    fun cacheManager(factory: LettuceConnectionFactory): RedisCacheManager {
+    fun cacheManager(connectionFactory: RedisConnectionFactory): RedisCacheManager {
+        val jsonSerializer = GenericJackson2JsonRedisSerializer(mapper)
         val defaults = RedisCacheConfiguration.defaultCacheConfig()
             .entryTtl(Duration.ofMinutes(10))
-            .serializeValuesWith(
-                RedisSerializationContext.SerializationPair.fromSerializer(
-                    Jackson2JsonRedisSerializer(Any::class.java)
-                )
+            .serializeKeysWith(
+                RedisSerializationContext.SerializationPair.fromSerializer(StringRedisSerializer())
             )
+            .serializeValuesWith(
+                RedisSerializationContext.SerializationPair.fromSerializer(jsonSerializer)
+            )
+            .disableCachingNullValues()
 
         val perCache = mapOf(
-            "users"    to defaults.entryTtl(Duration.ofMinutes(30)),
+            "menu"     to defaults.entryTtl(Duration.ofMinutes(10)),
             "sessions" to defaults.entryTtl(Duration.ofHours(2))
         )
 
-        return RedisCacheManager.builder(factory)
+        return RedisCacheManager.builder(connectionFactory)
             .cacheDefaults(defaults)
             .withInitialCacheConfigurations(perCache)
             .build()
@@ -753,7 +775,7 @@ class PubSubConfig {
 
     @Bean
     fun listenerContainer(
-        factory: LettuceConnectionFactory,
+        factory: RedisConnectionFactory,
         listener: UserEventListener
     ): RedisMessageListenerContainer {
         return RedisMessageListenerContainer().apply {
