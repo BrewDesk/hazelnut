@@ -20,10 +20,11 @@ Everything you need to build production Spring Boot services in Kotlin. All exam
 10. [Exception Handling](#exception-handling)
 11. [Validation](#validation)
 12. [Configuration](#configuration)
-13. [Security Basics](#security-basics)
-14. [Testing](#testing)
-15. [Coroutines with Spring](#coroutines-with-spring)
-16. [Quick Reference](#quick-reference)
+13. [Security & JWT](#security--jwt)
+14. [WebSocket / STOMP](#websocket--stomp)
+15. [Testing](#testing)
+16. [Coroutines with Spring](#coroutines-with-spring)
+17. [Quick Reference](#quick-reference)
 
 ---
 
@@ -457,6 +458,92 @@ object UserSpecs {
 val spec = UserSpecs.hasRole(UserRole.ADMIN).and(UserSpecs.nameContains("alice"))
 userRepository.findAll(spec, PageRequest.of(0, 20))
 ```
+
+### JSONB Columns (PostgreSQL)
+
+JSONB lets you store structured data in a column without a fixed schema. Useful for per-row config, modifier lists, or sparse fields.
+
+Add the Hypersistence Utils library — it registers Hibernate's `JsonType` for JSONB mapping:
+
+```kotlin
+// build.gradle.kts
+implementation("io.hypersistence:hypersistence-utils-hibernate-63:3.9.0")
+```
+
+```kotlin
+import io.hypersistence.utils.hibernate.type.json.JsonType
+import org.hibernate.annotations.Type
+
+@Entity
+@Table(name = "orders")
+class Order(
+
+    // Store a list of modifier objects as JSONB
+    @Type(JsonType::class)
+    @Column(columnDefinition = "jsonb")
+    var modifiers: List<ModifierSnapshot> = emptyList(),
+
+    // Store a freeform map as JSONB (e.g. per-staff preferences)
+    @Type(JsonType::class)
+    @Column(columnDefinition = "jsonb")
+    var settings: Map<String, Any> = emptyMap(),
+)
+
+// The nested type must be serializable by Jackson
+data class ModifierSnapshot(val name: String, val option: String, val priceDelta: Double = 0.0)
+```
+
+```kotlin
+// Querying into JSONB with a native query
+@Query(
+    "SELECT * FROM staff_users WHERE settings->>'theme' = :theme",
+    nativeQuery = true
+)
+fun findByTheme(@Param("theme") theme: String): List<StaffUser>
+```
+
+### Database Migrations (Flyway)
+
+Flyway runs versioned SQL scripts automatically on startup — safer than `spring.jpa.hibernate.ddl-auto=update` in production.
+
+```kotlin
+// build.gradle.kts
+implementation("org.flywaydb:flyway-core")
+implementation("org.flywaydb:flyway-database-postgresql")
+```
+
+```yaml
+# application.yml
+spring:
+  flyway:
+    enabled: true
+    baseline-on-migrate: true   # set true only for the first run on an existing DB
+```
+
+Place migration files in `src/main/resources/db/migration/`. Flyway runs them in version order on every startup, skipping scripts it has already applied.
+
+```
+db/migration/
+├── V1__init_schema.sql       # create all base tables
+├── V2__add_tax_rates.sql     # ALTER TABLE or CREATE TABLE
+└── V3__add_loyalty_pin.sql   # ADD COLUMN loyalty_pin_hash VARCHAR(255)
+```
+
+Naming rule: `V{version}__{description}.sql` — double underscore, no spaces in the description.
+
+```sql
+-- V2__add_tax_rates.sql
+CREATE TABLE tax_rates (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id  UUID NOT NULL REFERENCES tenants(id),
+    name       VARCHAR(100) NOT NULL,
+    rate       DECIMAL(5,4) NOT NULL,
+    active     BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+> Never edit a migration file after it has been applied — Flyway checksums each file and will refuse to start if a previously-run script has changed. Create a new `V{n+1}` script instead.
 
 ---
 
@@ -1061,55 +1148,214 @@ app:
 
 ---
 
-## Security Basics
+## Security & JWT
+
+### SecurityFilterChain
 
 ```kotlin
 @Configuration
 @EnableWebSecurity
-class SecurityConfig {
+class SecurityConfig(private val jwtAuthFilter: JwtAuthFilter) {
 
     @Bean
     fun securityFilterChain(http: HttpSecurity): SecurityFilterChain {
         http
-            .csrf { it.disable() }                              // disable for REST APIs
+            .csrf { it.disable() }
             .sessionManagement { it.sessionCreationPolicy(SessionCreationPolicy.STATELESS) }
             .authorizeHttpRequests { auth ->
                 auth
                     .requestMatchers("/api/v1/auth/**").permitAll()
                     .requestMatchers(HttpMethod.GET, "/api/v1/public/**").permitAll()
-                    .requestMatchers("/api/v1/admin/**").hasRole("ADMIN")
+                    .requestMatchers("/api/v1/admin/**").hasAnyRole("OWNER", "MANAGER")
+                    .requestMatchers("/api/v1/staff/**").hasAnyRole("OWNER", "MANAGER", "STAFF")
                     .anyRequest().authenticated()
             }
-            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter::class.java)
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter::class.java)
         return http.build()
     }
 
     @Bean
     fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder()
-
-    @Bean
-    fun authenticationManager(config: AuthenticationConfiguration): AuthenticationManager =
-        config.authenticationManager
 }
+```
 
-// Method-level security
+### JWT Filter (OncePerRequestFilter)
+
+The filter runs once per request, extracts the `Authorization` header, validates the token, and sets the `SecurityContext` so Spring Security knows who is making the request.
+
+```kotlin
+// build.gradle.kts
+implementation("io.jsonwebtoken:jjwt-api:0.12.6")
+runtimeOnly("io.jsonwebtoken:jjwt-impl:0.12.6")
+runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.12.6")
+```
+
+```kotlin
+@Service
+class JwtService {
+
+    // For RS256: load a private key for signing, public key for verification.
+    // For HS256: use a single secret key (simpler, but both sides share the secret).
+    private val secretKey: SecretKey = Keys.hmacShaKeyFor(
+        System.getenv("JWT_SECRET").toByteArray()
+    )
+
+    fun generate(subject: String, claims: Map<String, Any>, expiryHours: Long = 8): String =
+        Jwts.builder()
+            .subject(subject)
+            .claims(claims)
+            .issuedAt(Date())
+            .expiration(Date(System.currentTimeMillis() + expiryHours * 3_600_000))
+            .signWith(secretKey)
+            .compact()
+
+    fun parse(token: String): Claims =
+        Jwts.parser()
+            .verifyWith(secretKey)
+            .build()
+            .parseSignedClaims(token)
+            .payload
+}
+```
+
+```kotlin
+@Component
+class JwtAuthFilter(private val jwtService: JwtService) : OncePerRequestFilter() {
+
+    override fun doFilterInternal(
+        req: HttpServletRequest,
+        res: HttpServletResponse,
+        chain: FilterChain
+    ) {
+        val token = req.getHeader("Authorization")
+            ?.takeIf { it.startsWith("Bearer ") }
+            ?.removePrefix("Bearer ")
+
+        if (token != null) {
+            runCatching { jwtService.parse(token) }.getOrNull()?.let { claims ->
+                val role    = claims["role"] as? String ?: "USER"
+                val auth    = UsernamePasswordAuthenticationToken(
+                    claims, null, listOf(SimpleGrantedAuthority("ROLE_$role"))
+                )
+                SecurityContextHolder.getContext().authentication = auth
+            }
+        }
+
+        chain.doFilter(req, res)
+    }
+}
+```
+
+```kotlin
+// Accessing claims in a controller or service
+@GetMapping("/me")
+fun me(authentication: Authentication): Map<String, Any> {
+    @Suppress("UNCHECKED_CAST")
+    val claims = authentication.principal as Claims
+    return mapOf(
+        "sub"  to claims.subject,
+        "role" to (claims["role"] ?: ""),
+    )
+}
+```
+
+### Method-Level Security
+
+```kotlin
 @Service
 @PreAuthorize("hasRole('ADMIN')")          // class-level: all methods require ADMIN
 class AdminService {
 
-    @PreAuthorize("hasAnyRole('ADMIN', 'MODERATOR')")
-    fun moderatorAction() { }
+    @PreAuthorize("hasAnyRole('ADMIN', 'MANAGER')")
+    fun managerAction() { }
 
-    @PostAuthorize("returnObject.ownerId == authentication.principal.id")
+    @PostAuthorize("returnObject.ownerId == authentication.principal.subject")
     fun getResource(id: Long): Resource { }
 }
+```
 
-// Get the current user
-@GetMapping("/me")
-fun me(authentication: Authentication): UserResponse {
-    val principal = authentication.principal as UserDetails
-    return userService.findByEmail(principal.username)
+---
+
+## WebSocket / STOMP
+
+Spring's STOMP broker lets clients subscribe to topics and receive push messages — useful for real-time order updates, kitchen displays, or notifications.
+
+```kotlin
+// build.gradle.kts
+implementation("org.springframework.boot:spring-boot-starter-websocket")
+```
+
+### Configuration
+
+```kotlin
+@Configuration
+@EnableWebSocketMessageBroker
+class WebSocketConfig : WebSocketMessageBrokerConfigurer {
+
+    override fun configureMessageBroker(registry: MessageBrokerRegistry) {
+        registry.enableSimpleBroker("/topic", "/queue")   // server → client topics
+        registry.setApplicationDestinationPrefixes("/app") // client → server messages
+    }
+
+    override fun registerStompEndpoints(registry: StompEndpointRegistry) {
+        registry.addEndpoint("/ws")
+            .setAllowedOriginPatterns("*")
+            .withSockJS()   // fallback for browsers that don't support native WebSocket
+    }
 }
+```
+
+### Publishing Messages (Server → Client)
+
+```kotlin
+@Service
+class OrderPublisher(private val ws: SimpMessagingTemplate) {
+
+    // Broadcast to all subscribers on a topic
+    fun broadcastToTenant(tenantId: UUID, payload: Any) {
+        ws.convertAndSend("/topic/orders/$tenantId", payload)
+    }
+
+    // Send to a specific user (requires Spring Security principal name)
+    fun sendToUser(userId: String, payload: Any) {
+        ws.convertAndSendToUser(userId, "/queue/notifications", payload)
+    }
+}
+```
+
+### Receiving Messages from Client (Client → Server)
+
+```kotlin
+@Controller
+class OrderController {
+
+    // Client sends to /app/orders/advance; result is broadcast to the topic
+    @MessageMapping("/orders/advance")
+    @SendTo("/topic/orders/{tenantId}")
+    fun advanceOrder(@DestinationVariable tenantId: UUID, @Payload cmd: AdvanceOrderCmd): OrderEvent {
+        return orderService.advance(cmd.orderId, cmd.status)
+    }
+}
+```
+
+### JavaScript Client
+
+```javascript
+import { Client } from '@stomp/stompjs'
+import SockJS from 'sockjs-client'
+
+const client = new Client({
+    webSocketFactory: () => new SockJS('/ws'),
+    connectHeaders: { Authorization: `Bearer ${token}` },
+    onConnect: () => {
+        // Subscribe to a topic — fires on every push from the server
+        client.subscribe(`/topic/orders/${tenantId}`, (msg) => {
+            const event = JSON.parse(msg.body)
+            console.log('Order update:', event)
+        })
+    }
+})
+client.activate()
 ```
 
 ---
